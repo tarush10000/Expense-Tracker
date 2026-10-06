@@ -1,6 +1,6 @@
 require('dotenv').config();
 const express = require('express');
-const { processExpenseMessage, processReceiptImage, completePendingSplit, getTodayTotal, getMonthTotal, setMonthlyBudget, getBudgetStatus, setCategoryLimit, getCategoryLimitStatuses, getCategoryLimitAlert, getMonthlyReport, getOwedSummary, recordSettlement, getAveragePerDayThisMonth, getCategoryOverviewThisMonth, undoLastExpense, getLastExpense } = require('./expenseService');
+const { processExpenseMessage, processReceiptImage, getTodayTotal, getMonthTotal, setMonthlyBudget, getBudgetStatus, setCategoryLimit, getCategoryLimitStatuses, getCategoryLimitAlert, getMonthlyReport, getOwedSummary, recordSettlement, getAveragePerDayThisMonth, getCategoryOverviewThisMonth, undoLastExpense, getLastExpense } = require('./expenseService');
 const { telegramAuthMiddleware, verifyTelegramWebhook } = require('./telegramMiddleware');
 
 const app = express();
@@ -12,8 +12,6 @@ app.use(express.json());
 
 // Idempotency cache: store recently processed update IDs
 const processedUpdates = new Set();
-const pendingSplitClarifications = new Map();
-const PENDING_SPLIT_TTL_MS = 10 * 60 * 1000;
 // Health check endpoint
 app.get('/health', (req, res) => {
     res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() });
@@ -72,6 +70,29 @@ async function downloadTelegramPhoto(photo) {
     const response = await fetch(`https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${file.file_path}`);
     if (!response.ok) throw new Error(`Telegram image download failed with status ${response.status}`);
     return Buffer.from(await response.arrayBuffer());
+}
+
+async function sendRecordedExpenses(chatId, result, spreadsheetId, heading = 'Recorded') {
+    const entries = result.entries || (result.data ? [{ ...result.data, owed: result.owed || [] }] : []);
+    if (!entries.length) {
+        await sendTelegramReply(chatId, 'I could not find any transaction entries to record.');
+        return;
+    }
+
+    const lines = [];
+    const alerts = new Set();
+    for (const entry of entries) {
+        const owed = entry.owed?.length
+            ? `; owed: ${entry.owed.map(item => `${item.name} ₹${item.amount}`).join(', ')}`
+            : '';
+        lines.push(`₹${entry.amount} for ${entry.category} (${entry.need_want})${owed}`);
+        const alert = await getCategoryLimitAlert(entry.category, spreadsheetId);
+        if (alert) alerts.add(alert);
+    }
+
+    const count = entries.length;
+    const alertText = alerts.size ? `\n${Array.from(alerts).join('\n')}` : '';
+    await sendTelegramReply(chatId, `${heading} ${count} entr${count === 1 ? 'y' : 'ies'}:\n${lines.join('\n')}${alertText}`);
 }
 
 app.get('/telegram/webhook-info', authorizeWebhookAdmin, async (req, res) => {
@@ -152,9 +173,10 @@ app.post('/telegram/webhook', verifyTelegramWebhook, telegramAuthMiddleware, asy
             }
         }
 
+        const { username, spreadsheetId } = req;
+
         // Safe access Telegram message payload
         const msgObj = payload?.message;
-        const { username, spreadsheetId } = req;
         const text = msgObj.text;
         const chatId = msgObj.chat?.id;
 
@@ -165,11 +187,10 @@ app.post('/telegram/webhook', verifyTelegramWebhook, telegramAuthMiddleware, asy
                 const result = await processReceiptImage(imageBuffer, 'image/jpeg', msgObj.caption, spreadsheetId);
                 if (result.error) {
                     await sendTelegramReply(chatId, result.error);
+                } else if (result.type === 'clarification') {
+                    await sendTelegramReply(chatId, result.text);
                 } else {
-                    const owedMessage = result.owed?.length
-                        ? ` Owed: ${result.owed.map(entry => `${entry.name} ₹${entry.amount}`).join(', ')}.`
-                        : '';
-                    await sendTelegramReply(chatId, `Receipt recorded: ₹${result.data.amount} for ${result.data.category}.${owedMessage}`);
+                    await sendRecordedExpenses(chatId, result, spreadsheetId, 'Receipt recorded');
                 }
             } catch (error) {
                 console.error('Receipt webhook failed:', error.message);
@@ -183,11 +204,6 @@ app.post('/telegram/webhook', verifyTelegramWebhook, telegramAuthMiddleware, asy
         }
 
         console.log(`Processing Telegram Command: "${text}" from ${username}`);
-
-        const pendingSplit = pendingSplitClarifications.get(String(chatId));
-        if (pendingSplit && Date.now() - pendingSplit.createdAt > PENDING_SPLIT_TTL_MS) {
-            pendingSplitClarifications.delete(String(chatId));
-        }
 
         if (text === '/today') {
             const total = await getTodayTotal(spreadsheetId);
@@ -336,35 +352,11 @@ app.post('/telegram/webhook', verifyTelegramWebhook, telegramAuthMiddleware, asy
             await sendTelegramReply(chatId, `Good to see you, ${username}. I am ready to keep your finances in order.\n\nTry: "150 auto rickshaw" or send a receipt photo.\n\nCommands:\n/today - today's total\n/month - this month's total\n/budget 30000 - set a monthly budget\n/budget - review budget status\n/limit Food & Dining 8000 - set a category limit\n/limits - review category limits\n/report - monthly financial report\n/owed - amounts owed to you\n/owed Yash - one person's balance\n/paid Yash 500 - record a repayment\n/avg - daily average and projection\n/overview - category breakdown\n/last - most recent transaction\n/undo - remove the last expense`);
         }
         else {
-            let aiResult;
-            const activePendingSplit = pendingSplitClarifications.get(String(chatId));
-            if (activePendingSplit) {
-                const completedSplit = completePendingSplit(activePendingSplit, text);
-                if (completedSplit.error) {
-                    await sendTelegramReply(chatId, completedSplit.error);
-                    return res.status(200).send('Telegram webhook processed');
-                }
-                pendingSplitClarifications.delete(String(chatId));
-                aiResult = await processExpenseMessage(text, spreadsheetId, completedSplit);
-            } else {
-                aiResult = await processExpenseMessage(text, spreadsheetId);
-            }
+            const aiResult = await processExpenseMessage(text, spreadsheetId);
             if (aiResult.error) {
-                // LLM or Service error
-                if (aiResult.pending) {
-                    pendingSplitClarifications.set(String(chatId), {
-                        ...aiResult.pending,
-                        createdAt: Date.now()
-                    });
-                }
                 await sendTelegramReply(chatId, `I could not complete that request: ${aiResult.error}`);
             } else if (aiResult.type === 'log') {
-                const expenseData = aiResult.data;
-                const owedMessage = aiResult.owed?.length
-                    ? `\nOwed: ${aiResult.owed.map(entry => `${entry.name} ₹${entry.amount}`).join(', ')}`
-                    : '';
-                const limitAlert = await getCategoryLimitAlert(expenseData.category, spreadsheetId);
-                await sendTelegramReply(chatId, `Recorded ₹${expenseData.amount} for ${expenseData.category} (${expenseData.need_want}).${owedMessage}${limitAlert ? `\n${limitAlert}` : ''}`);
+                await sendRecordedExpenses(chatId, aiResult, spreadsheetId);
             } else if (aiResult.type === 'query' || aiResult.type === 'chat') {
                 await sendTelegramReply(chatId, aiResult.text);
             }

@@ -55,23 +55,51 @@ const CATEGORIES = [
 const geminiTools = [{
     functionDeclarations: [
         {
-            name: "logExpense",
-            description: "Logs a new expense. Use this tool if the user provides a transaction or an expense to record. Generate dummy values if is_error is true. If the user mentions earning money (or uses a negative amount), the logged amount must be a negative number.",
+            name: "draftExpenses",
+            description: "Creates a draft JSON for one or more transactions. Never logs or saves transactions. Negative amounts represent income.",
             parameters: {
                 type: "OBJECT",
                 properties: {
-                    is_error: { type: "BOOLEAN", description: "Set to true if there is missing vital information to log the expense, like amount." },
-                    error_message: { type: "STRING", description: "Friendly message asking for the missing info if is_error is true." },
-                    amount: { type: "NUMBER" },
-                    category: { type: "STRING", enum: CATEGORIES, description: "Must be one of the provided categories." },
-                    subcategory: { type: "STRING" },
-                    description: { type: "STRING" },
-                    merchant: { type: "STRING" },
-                    payment_method: { type: "STRING", description: "Default to 'UPI' if unspecified." },
-                    need_want: { type: "STRING", enum: ["Need", "Want"] },
-                    date: { type: "STRING", description: "YYYY-MM-DD format" },
+                    needs_clarification: { type: "BOOLEAN" },
+                    clarification_question: { type: "STRING" },
+                    entries: {
+                        type: "ARRAY",
+                        items: {
+                            type: "OBJECT",
+                            properties: {
+                                amount: { type: "NUMBER" },
+                                category: { type: "STRING", description: "Optional best-effort category; do not block a draft because categorization is uncertain." },
+                                subcategory: { type: "STRING" },
+                                description: { type: "STRING" },
+                                merchant: { type: "STRING" },
+                                payment_method: { type: "STRING" },
+                                need_want: { type: "STRING" },
+                                date: { type: "STRING", description: "YYYY-MM-DD format" },
+                                split: {
+                                    type: "OBJECT",
+                                    properties: {
+                                        original_amount: { type: "NUMBER" },
+                                        reason: { type: "STRING" },
+                                        owed_entries: {
+                                            type: "ARRAY",
+                                            items: {
+                                                type: "OBJECT",
+                                                properties: {
+                                                    name: { type: "STRING" },
+                                                    amount: { type: "NUMBER" }
+                                                },
+                                                required: ["name", "amount"]
+                                            }
+                                        }
+                                    },
+                                    required: ["original_amount", "reason", "owed_entries"]
+                                }
+                            },
+                            required: ["amount", "date"]
+                        }
+                    }
                 },
-                required: ["is_error", "error_message", "amount", "category", "subcategory", "description", "merchant", "payment_method", "need_want", "date"],
+                required: ["needs_clarification", "clarification_question", "entries"],
             }
         },
         {
@@ -431,7 +459,7 @@ async function recordExpenseData(expenseData, spreadsheetId) {
         return { error: 'I need a clear numeric amount before I can record that expense.' };
     }
     expenseData.amount = Number(normalizedAmount.toFixed(2));
-    if (!CATEGORIES.includes(expenseData.category)) expenseData.category = 'Miscellaneous';
+    expenseData.category = String(expenseData.category || 'Miscellaneous').trim() || 'Miscellaneous';
     if (!/^\d{4}-\d{2}-\d{2}$/.test(expenseData.date) || Number.isNaN(Date.parse(expenseData.date))) {
         expenseData.date = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
     }
@@ -517,17 +545,56 @@ async function recordSplitExpense(splitData, spreadsheetId) {
     return { type: 'log', data: expenseData, owed: splitData.owedEntries };
 }
 
-async function processExpenseMessage(message, spreadsheetId, splitOverride = null) {
-    const splitData = splitOverride || parseSplitExpenseMessage(message);
-    if (splitData?.error) {
-        return { error: splitData.error, pending: splitData.pending };
-    }
-    if (splitData) {
-        return recordSplitExpense(splitData, spreadsheetId);
+async function recordExpenseDraft(draft, spreadsheetId) {
+    if (!Array.isArray(draft?.entries) || draft.entries.length === 0) {
+        return { error: 'This draft has no entries to record.' };
     }
 
+    for (const entry of draft.entries) {
+        if (!entry || typeof entry !== 'object' || entry.amount === null || entry.amount === '' || !Number.isFinite(Number(entry.amount))) {
+            return { error: 'A draft entry is missing a valid amount. Please send the transaction again.' };
+        }
+        if (entry.split) {
+            const split = entry.split;
+            const owedEntries = split.owed_entries;
+            const originalAmount = Number(split.original_amount);
+            if (!Number.isFinite(originalAmount) || !Array.isArray(owedEntries) || owedEntries.length === 0 ||
+                owedEntries.some(owed => !owed || !String(owed.name || '').trim() || !Number.isFinite(Number(owed.amount)) || Number(owed.amount) < 0)) {
+                return { error: 'The split details are incomplete. Please send the transaction again.' };
+            }
+            const splitTotal = Number(entry.amount) + owedEntries.reduce((total, owed) => total + Number(owed.amount), 0);
+            if (Math.abs(splitTotal - originalAmount) > 0.01) {
+                return { error: 'The split shares do not add up to the original amount. Please send the transaction details again.' };
+            }
+        }
+    }
+
+    const recordedEntries = [];
+    for (const entry of draft.entries) {
+        const { split, ...expenseData } = entry;
+        const result = await recordExpenseData(expenseData, spreadsheetId);
+        if (result.error) return result;
+
+        const owed = split?.owed_entries || [];
+        if (owed.length) {
+            const time = new Date().toLocaleTimeString('en-GB', { timeZone: 'Asia/Kolkata' });
+            const addedAt = `${new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' })} ${time}`;
+            await appendOwedEntries({
+                originalAmount: Number(split.original_amount),
+                reason: split.reason || 'Split expense',
+                owedEntries: owed.map(item => ({ name: String(item.name).trim(), amount: Number(item.amount) }))
+            }, result.data.date, addedAt, result.data.transactionId, spreadsheetId);
+        }
+        recordedEntries.push({ ...result.data, owed });
+    }
+
+    return { type: 'log', entries: recordedEntries };
+}
+
+async function processExpenseMessage(message, spreadsheetId) {
+
     const todayIST = new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata', month: 'long', day: 'numeric', year: 'numeric', hour: 'numeric', minute: 'numeric', hour12: true });
-    const prompt = `You are a discreet, capable personal finance butler. Evaluate this message: "${message}". Decide whether the user wants to record an expense, query spending, or chat. For an expense, call logExpense only when the amount is clear; never invent a real amount, merchant, or date. If essential information is missing, set is_error to true and ask one concise clarification. Negative amounts are income and must remain negative. For queries, call queryExpenses. Use today's date in India when no date is given: ${todayIST}. Default payment_method to "UPI" only when it is not stated. Choose need_want conservatively: recurring essentials are Needs, discretionary purchases are Wants. Be practical and gently point out useful context when replying, but do not lecture. Keep replies concise, plain text, and free of Markdown markers and emojis.`;
+    const prompt = `You are a personal finance assistant. Evaluate this message: "${message}". Decide whether the user wants to record transactions, query spending, or chat. For transaction messages, call draftExpenses and include every distinct transaction in entries. Do not log or save anything. Do not require a category to understand or draft a transaction; category is optional and must not cause clarification by itself. Never invent an amount. If the amount is missing or ambiguous, set needs_clarification to true, provide one concise clarification_question, and leave entries empty. Preserve negative amounts as income. For a split, include the original total, the user's personal share as entry amount, and each other person's owed amount in split. Use today's date in India if none is given: ${todayIST}. Use "UPI" as payment_method only as a fallback. For queries, call queryExpenses. Keep chat and query replies concise and plain text.`;
 
     console.log(`[DEBUG] Calling Gemini API...`);
 
@@ -560,8 +627,16 @@ async function processExpenseMessage(message, spreadsheetId, splitOverride = nul
             const functionCall = response.functionCalls?.[0];
 
             if (functionCall) {
-                if (functionCall.name === "logExpense") {
-                    resultPayload = { type: 'log', data: functionCall.args };
+                if (functionCall.name === "draftExpenses") {
+                    const draft = functionCall.args;
+                    if (draft.needs_clarification || !draft.entries?.length) {
+                        resultPayload = {
+                            type: 'clarification',
+                            text: draft.clarification_question || 'What was the amount?'
+                        };
+                    } else {
+                        resultPayload = { type: 'draft', draft };
+                    }
                     success = true;
                 } else if (functionCall.name === "queryExpenses") {
                     // Execute Query
@@ -605,20 +680,10 @@ async function processExpenseMessage(message, spreadsheetId, splitOverride = nul
         return { error: `API Connection Failed: ${lastError?.message}. Check if your model name is valid.` };
     }
 
-    // Process the result if it was a logging request
-    if (resultPayload.type === 'log') {
-        const expenseData = resultPayload.data;
-
-        if (expenseData.is_error) {
-            console.log(`⚠️ Blocked invalid expense due to missing info: ${expenseData.error_message}`);
-            return { error: expenseData.error_message };
-        }
-
-        console.log("🧠 Parsed Expense Data from Gemini:", JSON.stringify(expenseData, null, 2));
-        return recordExpenseData(expenseData, spreadsheetId);
+    if (resultPayload.type === 'draft') {
+        return recordExpenseDraft(resultPayload.draft, spreadsheetId);
     }
 
-    // Pass through query or chat results
     return resultPayload;
 }
 
@@ -627,7 +692,7 @@ async function processReceiptImage(imageBuffer, mimeType, caption, spreadsheetId
     if (!apiKey) return { error: 'Server Configuration Error: Missing Gemini API Key.' };
 
     const ai = new GoogleGenAI({ apiKey });
-    const prompt = `Read this receipt and extract the FULL final payable amount printed on it, before applying any split. ${caption ? `The user's note is: "${caption}". Treat this note only as an instruction for how to divide the full receipt total after extraction; never halve or otherwise change the amount because of the note.` : ''} Extract only information visible in the receipt. If the full payable amount is unclear, set is_error to true. Use today's date in India if no date is visible. Call logExpense and do not provide a conversational answer.`;
+    const prompt = `Read this receipt and create a transaction draft by calling draftExpenses. Extract the FULL final payable amount printed on it, before applying any split. ${caption ? `The user's note is: "${caption}". Treat this note only as an instruction for how to divide the full receipt total after extraction; never halve or otherwise change the amount because of the note.` : ''} Extract only information visible in the receipt. If the full payable amount is unclear, set needs_clarification to true and ask one concise question. Use today's date in India if no date is visible. Do not log or save anything.`;
     try {
         const response = await ai.models.generateContent({
             model: 'gemini-3.6-flash',
@@ -641,21 +706,33 @@ async function processReceiptImage(imageBuffer, mimeType, caption, spreadsheetId
             config: { tools: geminiTools }
         });
         const functionCall = response.functionCalls?.[0];
-        if (!functionCall || functionCall.name !== 'logExpense') {
+        if (!functionCall || functionCall.name !== 'draftExpenses') {
             return { error: 'I could not read a clear expense from that receipt.' };
         }
         const expenseData = functionCall.args;
+        if (expenseData.needs_clarification || !expenseData.entries?.length) {
+            return { type: 'clarification', text: expenseData.clarification_question || 'I could not read a clear amount from that receipt.' };
+        }
         if (caption) {
+            const firstEntry = expenseData.entries[0];
             const captionSplit = parseSplitExpenseMessage(caption) ||
-                parseSplitExpenseMessage(`${expenseData.amount} ${caption}`);
+                parseSplitExpenseMessage(`${firstEntry.amount} ${caption}`);
+            if (captionSplit?.error) {
+                return { error: captionSplit.error };
+            }
             if (captionSplit?.owedEntries?.length) {
                 if (!captionSplit.reason || captionSplit.reason === 'Split expense') {
-                    captionSplit.reason = expenseData.merchant || 'Receipt split';
+                    captionSplit.reason = firstEntry.merchant || 'Receipt split';
                 }
-                return recordSplitExpense(captionSplit, spreadsheetId);
+                firstEntry.amount = captionSplit.amount;
+                firstEntry.split = {
+                    original_amount: captionSplit.originalAmount,
+                    reason: captionSplit.reason,
+                    owed_entries: captionSplit.owedEntries
+                };
             }
         }
-        return recordExpenseData(expenseData, spreadsheetId);
+        return recordExpenseDraft(expenseData, spreadsheetId);
     } catch (error) {
         console.error('Receipt parsing failed:', error.message);
         return { error: 'I could not read that receipt. Please send a clearer image or enter the amount manually.' };
@@ -1192,6 +1269,7 @@ async function undoLastExpense(spreadsheetId) {
 module.exports = {
     processExpenseMessage,
     processReceiptImage,
+    recordExpenseDraft,
     parseSplitExpenseMessage,
     completePendingSplit,
     getTodayTotal,
