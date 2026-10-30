@@ -52,71 +52,124 @@ const CATEGORIES = [
     "Miscellaneous"
 ];
 
-const geminiTools = [{
-    functionDeclarations: [
-        {
-            name: "draftExpenses",
-            description: "Creates a draft JSON for one or more transactions. Never logs or saves transactions. Negative amounts represent income.",
-            parameters: {
-                type: "OBJECT",
+const GEMINI_MODELS = [
+    { name: 'gemini-3.6-flash', weight: 10 },
+    { name: 'gemini-3.8-live', weight: 25 },
+    { name: 'gemini-3.8-flash', weight: 65 }
+];
+
+const GEMINI_RESPONSE_SCHEMA = {
+    type: 'OBJECT',
+    properties: {
+        action: { type: 'STRING', enum: ['expense', 'query', 'chat', 'clarification'] },
+        text: { type: 'STRING' },
+        needs_clarification: { type: 'BOOLEAN' },
+        clarification_question: { type: 'STRING' },
+        entries: {
+            type: 'ARRAY',
+            items: {
+                type: 'OBJECT',
                 properties: {
-                    needs_clarification: { type: "BOOLEAN" },
-                    clarification_question: { type: "STRING" },
-                    entries: {
-                        type: "ARRAY",
-                        items: {
-                            type: "OBJECT",
-                            properties: {
-                                amount: { type: "NUMBER" },
-                                category: { type: "STRING", description: "Optional best-effort category; do not block a draft because categorization is uncertain." },
-                                subcategory: { type: "STRING" },
-                                description: { type: "STRING" },
-                                merchant: { type: "STRING" },
-                                payment_method: { type: "STRING" },
-                                need_want: { type: "STRING" },
-                                date: { type: "STRING", description: "YYYY-MM-DD format" },
-                                split: {
-                                    type: "OBJECT",
+                    amount: { type: 'NUMBER' },
+                    category: { type: 'STRING' },
+                    subcategory: { type: 'STRING' },
+                    description: { type: 'STRING' },
+                    merchant: { type: 'STRING' },
+                    payment_method: { type: 'STRING' },
+                    need_want: { type: 'STRING', enum: ['Need', 'Want'] },
+                    date: { type: 'STRING', description: 'YYYY-MM-DD format' },
+                    split: {
+                        type: 'OBJECT',
+                        properties: {
+                            original_amount: { type: 'NUMBER' },
+                            reason: { type: 'STRING' },
+                            owed_entries: {
+                                type: 'ARRAY',
+                                items: {
+                                    type: 'OBJECT',
                                     properties: {
-                                        original_amount: { type: "NUMBER" },
-                                        reason: { type: "STRING" },
-                                        owed_entries: {
-                                            type: "ARRAY",
-                                            items: {
-                                                type: "OBJECT",
-                                                properties: {
-                                                    name: { type: "STRING" },
-                                                    amount: { type: "NUMBER" }
-                                                },
-                                                required: ["name", "amount"]
-                                            }
-                                        }
+                                        name: { type: 'STRING' },
+                                        amount: { type: 'NUMBER' }
                                     },
-                                    required: ["original_amount", "reason", "owed_entries"]
+                                    required: ['name', 'amount']
                                 }
-                            },
-                            required: ["amount", "date"]
-                        }
+                            }
+                        },
+                        required: ['original_amount', 'reason', 'owed_entries']
                     }
                 },
-                required: ["needs_clarification", "clarification_question", "entries"],
+                required: ['amount', 'date']
             }
         },
-        {
-            name: "queryExpenses",
-            description: "Queries past expenses for a specific timeframe. Use this when the user asks questions like 'how much did I spend on food this week?'.",
-            parameters: {
-                type: "OBJECT",
-                properties: {
-                    startDate: { type: "STRING", description: "YYYY-MM-DD" },
-                    endDate: { type: "STRING", description: "YYYY-MM-DD" },
-                    category: { type: "STRING", description: "Optional category to filter by", enum: CATEGORIES }
-                },
-                required: ["startDate", "endDate"]
-            }
+        query: {
+            type: 'OBJECT',
+            properties: {
+                startDate: { type: 'STRING', description: 'YYYY-MM-DD' },
+                endDate: { type: 'STRING', description: 'YYYY-MM-DD' },
+                category: { type: 'STRING', enum: ['', ...CATEGORIES] }
+            },
+            required: ['startDate', 'endDate', 'category']
         }
-    ]
-}];
+    },
+    required: ['action', 'text', 'needs_clarification', 'clarification_question', 'entries', 'query']
+};
+
+function getRandomGeminiModel() {
+    const totalWeight = GEMINI_MODELS.reduce((total, model) => total + model.weight, 0);
+    let selection = Math.random() * totalWeight;
+    for (const model of GEMINI_MODELS) {
+        selection -= model.weight;
+        if (selection < 0) return model.name;
+    }
+    return GEMINI_MODELS[GEMINI_MODELS.length - 1].name;
+}
+
+function isRateLimitError(error) {
+    return error.status === 429 ||
+        (error.message && (error.message.includes('429') ||
+            error.message.includes('Too Many Requests') ||
+            error.message.toLowerCase().includes('quota')));
+}
+
+async function generateGeminiContent(contents, config = {}) {
+    if (GEMINI_API_KEYS.length === 0) {
+        throw new Error('Missing Gemini API Key.');
+    }
+
+    const maxAttempts = Math.min(GEMINI_API_KEYS.length + 1, 3);
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        const ai = new GoogleGenAI({ apiKey: getRandomGeminiKey() });
+        const model = getRandomGeminiModel();
+        try {
+            const response = await ai.models.generateContent({ model, contents, config });
+            return response;
+        } catch (error) {
+            console.error(`[DEBUG] ❌ Gemini API threw an error on attempt ${attempt} using ${model}:`, error.message);
+            if (!isRateLimitError(error) || attempt === maxAttempts) throw error;
+            console.log('⚠️ Rate limit encountered. Retrying with a newly selected key and model...');
+        }
+    }
+
+    throw new Error('Gemini request failed without returning a response.');
+}
+
+function parseGeminiJson(response) {
+    if (!response.text) {
+        throw new Error('Gemini returned an empty structured response.');
+    }
+
+    let result;
+    try {
+        result = JSON.parse(response.text);
+    } catch (error) {
+        throw new Error(`Gemini returned invalid JSON: ${error.message}`);
+    }
+
+    if (!result || !['expense', 'query', 'chat', 'clarification'].includes(result.action)) {
+        throw new Error('Gemini returned an unsupported response action.');
+    }
+    return result;
+}
 
 function getMonthSheetName(dateInput = new Date()) {
     const dateObj = new Date(dateInput);
@@ -592,145 +645,93 @@ async function recordExpenseDraft(draft, spreadsheetId) {
 }
 
 async function processExpenseMessage(message, spreadsheetId) {
-
     const todayIST = new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata', month: 'long', day: 'numeric', year: 'numeric', hour: 'numeric', minute: 'numeric', hour12: true });
-    const prompt = `You are a personal finance assistant. Evaluate this message: "${message}". Decide whether the user wants to record transactions, query spending, or chat. For transaction messages, call draftExpenses and include every distinct transaction in entries. Do not log or save anything. Do not require a category to understand or draft a transaction; category is optional and must not cause clarification by itself. Never invent an amount. If the amount is missing or ambiguous, set needs_clarification to true, provide one concise clarification_question, and leave entries empty. Preserve negative amounts as income. For a split, include the original total, the user's personal share as entry amount, and each other person's owed amount in split. Use today's date in India if none is given: ${todayIST}. Use "UPI" as payment_method only as a fallback. For queries, call queryExpenses. Keep chat and query replies concise and plain text.`;
-
+    const instructions = `You are a personal finance assistant. Interpret the user's exact message and respond only with JSON matching the supplied schema. Set action to "expense" for transactions, "query" for spending questions, "chat" for conversation, or "clarification" when essential transaction details are missing or ambiguous. For expenses, include every distinct transaction in entries. Never save or log anything. Do not require a category to understand or draft a transaction; use a best-effort category. Never invent an amount. If an amount is missing or ambiguous, set needs_clarification to true, provide one concise clarification_question, and leave entries empty. Preserve negative amounts as income. For a split, include the full original total, the user's personal share as entry amount, and each other person's owed amount in split. Use today's date in India if none is given: ${todayIST}. Use "UPI" as payment_method only as a fallback. For queries, include the requested date range in query and use an empty category when no category filter applies. Keep chat text concise.`;
     console.log(`[DEBUG] Calling Gemini API...`);
 
-    let resultPayload = null;
-    let success = false;
-    let attempts = 0;
-    const maxAttempts = GEMINI_API_KEYS.length > 0 ? Math.min(GEMINI_API_KEYS.length + 1, 3) : 1;
-    let lastError = null;
+    if (GEMINI_API_KEYS.length === 0) {
+        console.error('[DEBUG] ❌ No Gemini API Key found in environment variables.');
+        return { error: 'Server Configuration Error: Missing API Key.' };
+    }
 
-    while (!success && attempts < maxAttempts) {
-        attempts++;
-        const apiKey = GEMINI_API_KEYS.length > 0 ? getRandomGeminiKey() : process.env.GEMINI_API_KEY;
+    let response;
+    try {
+        response = await generateGeminiContent(
+            [{ role: 'user', parts: [{ text: instructions }, { text: message }] }],
+            { responseMimeType: 'application/json', responseSchema: GEMINI_RESPONSE_SCHEMA }
+        );
+    } catch (error) {
+        return { error: `API Connection Failed: ${error.message}. Check if the selected model is available.` };
+    }
 
-        if (!apiKey) {
-            console.error(`[DEBUG] ❌ No Gemini API Key found in environment variables.`);
-            return { error: `Server Configuration Error: Missing API Key.` };
+    let result;
+    try {
+        result = parseGeminiJson(response);
+    } catch (error) {
+        console.error('Gemini returned an invalid structured response:', error.message);
+        return { error: `Could not understand Gemini's response: ${error.message}` };
+    }
+
+    if (result.action === 'clarification' || (result.action === 'expense' && result.needs_clarification)) {
+        return {
+            type: 'clarification',
+            text: result.clarification_question || 'What was the missing transaction detail?'
+        };
+    }
+
+    if (result.action === 'expense') {
+        if (!result.entries?.length) {
+            return { type: 'clarification', text: 'What transaction would you like me to record?' };
         }
+        return recordExpenseDraft(result, spreadsheetId);
+    }
 
-        const ai = new GoogleGenAI({ apiKey: apiKey });
+    if (result.action === 'query') {
+        const { startDate, endDate, category } = result.query || {};
+        if (!startDate || !endDate) {
+            return { type: 'clarification', text: 'What date range should I check?' };
+        }
 
         try {
-            const response = await ai.models.generateContent({
-                model: 'gemini-3.6-flash',
-                contents: [{ role: "user", parts: [{ text: prompt }] }],
-                config: {
-                    tools: geminiTools
-                }
-            });
-
-            const functionCall = response.functionCalls?.[0];
-
-            if (functionCall) {
-                if (functionCall.name === "draftExpenses") {
-                    const draft = functionCall.args;
-                    if (draft.needs_clarification || !draft.entries?.length) {
-                        resultPayload = {
-                            type: 'clarification',
-                            text: draft.clarification_question || 'What was the amount?'
-                        };
-                    } else {
-                        resultPayload = { type: 'draft', draft };
-                    }
-                    success = true;
-                } else if (functionCall.name === "queryExpenses") {
-                    // Execute Query
-                    const queryArgs = functionCall.args;
-                    const queryResult = await queryExpenses(queryArgs.startDate, queryArgs.endDate, queryArgs.category, spreadsheetId);
-
-                    // Call Gemini again to construct final message
-                    const followupResponse = await ai.models.generateContent({
-                        model: 'gemini-3.6-flash',
-                        contents: [
-                            { role: "user", parts: [{ text: prompt }] },
-                            response.candidates[0].content,
-                            { role: "user", parts: [{ functionResponse: { name: functionCall.name, response: queryResult } }] }
-                        ]
-                    });
-
-                    resultPayload = { type: 'query', text: followupResponse.text };
-                    success = true;
-                }
-            } else {
-                // If the model didn't call a tool, it likely means invalid request or casual chat
-                resultPayload = { type: 'chat', text: response.text };
-                success = true;
-            }
-        } catch (apiError) {
-            lastError = apiError;
-            console.error(`[DEBUG] ❌ Gemini API threw an error on attempt ${attempts}:`, apiError.message);
-
-            const isRateLimit = apiError.status === 429 ||
-                (apiError.message && (apiError.message.includes('429') || apiError.message.includes('Too Many Requests') || apiError.message.includes('quota')));
-
-            if (isRateLimit && attempts < maxAttempts) {
-                console.log(`⚠️ 429 error encountered limit hit. Retrying with another key...`);
-            } else {
-                break;
-            }
+            const queryResult = await queryExpenses(startDate, endDate, category || undefined, spreadsheetId);
+            const followup = await generateGeminiContent([{
+                role: 'user',
+                parts: [{
+                    text: `Answer the user's spending question concisely using only this query result.\nUser message: ${message}\nQuery result JSON: ${JSON.stringify(queryResult)}`
+                }]
+            }]);
+            return { type: 'query', text: followup.text };
+        } catch (error) {
+            return { error: `Could not complete the spending query: ${error.message}` };
         }
     }
 
-    if (!success) {
-        return { error: `API Connection Failed: ${lastError?.message}. Check if your model name is valid.` };
-    }
-
-    if (resultPayload.type === 'draft') {
-        return recordExpenseDraft(resultPayload.draft, spreadsheetId);
-    }
-
-    return resultPayload;
+    return { type: 'chat', text: result.text || 'How can I help with your expenses?' };
 }
 
 async function processReceiptImage(imageBuffer, mimeType, caption, spreadsheetId) {
-    const apiKey = getRandomGeminiKey();
-    if (!apiKey) return { error: 'Server Configuration Error: Missing Gemini API Key.' };
+    if (GEMINI_API_KEYS.length === 0) return { error: 'Server Configuration Error: Missing Gemini API Key.' };
 
-    const ai = new GoogleGenAI({ apiKey });
-    const prompt = `Read this receipt and create a transaction draft by calling draftExpenses. Extract the FULL final payable amount printed on it, before applying any split. ${caption ? `The user's note is: "${caption}". Treat this note only as an instruction for how to divide the full receipt total after extraction; never halve or otherwise change the amount because of the note.` : ''} Extract only information visible in the receipt. If the full payable amount is unclear, set needs_clarification to true and ask one concise question. Use today's date in India if no date is visible. Do not log or save anything.`;
+    const todayIST = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+    const instructions = `Read this receipt and respond only with JSON matching the supplied schema. Set action to "expense" or "clarification". Extract the FULL final payable amount printed on the receipt before applying any split, and extract only information visible in the receipt. ${caption ? "Treat the user's caption as instructions for categorizing or dividing the full receipt total; do not change the receipt total merely because of the caption." : ''} If the full payable amount is unclear, set needs_clarification to true and ask one concise question. Apply any split requested in the caption or visible transaction message in the JSON entry's split field. Use today's date in India if no date is visible: ${todayIST}. Do not log or save anything.`;
+    const parts = [{ text: instructions }];
+    if (caption) parts.push({ text: caption });
+    parts.push({ inlineData: { mimeType: mimeType || 'image/jpeg', data: imageBuffer.toString('base64') } });
+
     try {
-        const response = await ai.models.generateContent({
-            model: 'gemini-3.6-flash',
-            contents: [{
-                role: 'user',
-                parts: [
-                    { text: prompt },
-                    { inlineData: { mimeType: mimeType || 'image/jpeg', data: imageBuffer.toString('base64') } }
-                ]
-            }],
-            config: { tools: geminiTools }
-        });
-        const functionCall = response.functionCalls?.[0];
-        if (!functionCall || functionCall.name !== 'draftExpenses') {
+        const response = await generateGeminiContent(
+            [{ role: 'user', parts }],
+            { responseMimeType: 'application/json', responseSchema: GEMINI_RESPONSE_SCHEMA }
+        );
+        const expenseData = parseGeminiJson(response);
+        if (expenseData.action !== 'expense' && expenseData.action !== 'clarification') {
             return { error: 'I could not read a clear expense from that receipt.' };
         }
-        const expenseData = functionCall.args;
-        if (expenseData.needs_clarification || !expenseData.entries?.length) {
-            return { type: 'clarification', text: expenseData.clarification_question || 'I could not read a clear amount from that receipt.' };
-        }
-        if (caption) {
-            const firstEntry = expenseData.entries[0];
-            const captionSplit = parseSplitExpenseMessage(caption) ||
-                parseSplitExpenseMessage(`${firstEntry.amount} ${caption}`);
-            if (captionSplit?.error) {
-                return { error: captionSplit.error };
-            }
-            if (captionSplit?.owedEntries?.length) {
-                if (!captionSplit.reason || captionSplit.reason === 'Split expense') {
-                    captionSplit.reason = firstEntry.merchant || 'Receipt split';
-                }
-                firstEntry.amount = captionSplit.amount;
-                firstEntry.split = {
-                    original_amount: captionSplit.originalAmount,
-                    reason: captionSplit.reason,
-                    owed_entries: captionSplit.owedEntries
-                };
-            }
+        if (expenseData.action === 'clarification' || expenseData.needs_clarification || !expenseData.entries?.length) {
+            return {
+                type: 'clarification',
+                text: expenseData.clarification_question || 'I could not read a clear amount from that receipt.'
+            };
         }
         return recordExpenseDraft(expenseData, spreadsheetId);
     } catch (error) {
