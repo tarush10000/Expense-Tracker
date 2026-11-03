@@ -40,6 +40,7 @@ try {
 }
 
 const CATEGORIES = [
+    "Food",
     "Food & Dining",
     "Transportation",
     "Shopping",
@@ -70,10 +71,10 @@ const GEMINI_RESPONSE_SCHEMA = {
                 type: 'OBJECT',
                 properties: {
                     amount: { type: 'NUMBER' },
-                    category: { type: 'STRING' },
-                    subcategory: { type: 'STRING' },
-                    description: { type: 'STRING' },
-                    merchant: { type: 'STRING' },
+                    category: { type: 'STRING', description: 'Use a concise category name. For food, use Food.' },
+                    subcategory: { type: 'STRING', description: 'Use a short, specific label of one to three words, never a category hierarchy or explanatory text.' },
+                    description: { type: 'STRING', description: 'Use a brief plain-language description of the transaction.' },
+                    merchant: { type: 'STRING', description: 'Use the merchant name only when the user or receipt identifies one; otherwise use an empty string.' },
                     payment_method: { type: 'STRING' },
                     need_want: { type: 'STRING', enum: ['Need', 'Want'] },
                     date: { type: 'STRING', description: 'YYYY-MM-DD format' },
@@ -524,7 +525,7 @@ async function recordExpenseData(expenseData, spreadsheetId) {
     }
     expenseData.description = String(expenseData.description || expenseData.merchant || 'Expense').trim();
     expenseData.subcategory = String(expenseData.subcategory || 'General').trim();
-    expenseData.merchant = String(expenseData.merchant || 'Unknown').trim();
+    expenseData.merchant = String(expenseData.merchant || '').trim();
     expenseData.payment_method = String(expenseData.payment_method || 'UPI').trim();
     expenseData.need_want = expenseData.need_want === 'Want' ? 'Want' : 'Need';
 
@@ -652,7 +653,7 @@ async function recordExpenseDraft(draft, spreadsheetId) {
 
 async function processExpenseMessage(message, spreadsheetId) {
     const todayIST = new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata', month: 'long', day: 'numeric', year: 'numeric', hour: 'numeric', minute: 'numeric', hour12: true });
-    const instructions = `You are a personal finance assistant. Interpret the user's exact message and respond only with JSON matching the supplied schema. Set action to "expense" for transactions, "query" for spending questions, "chat" for conversation, or "clarification" when essential transaction details are missing or ambiguous. For expenses, include every distinct transaction in entries. Never save or log anything. Do not require a category to understand or draft a transaction; use a best-effort category. Never invent an amount. If an amount is missing or ambiguous, set needs_clarification to true, provide one concise clarification_question, and leave entries empty. Preserve negative amounts as income. For a split, include the full original total, the user's personal share as entry amount, and each other person's owed amount in split. Use today's date in India if none is given: ${todayIST}. Use "UPI" as payment_method only as a fallback. For queries, include the requested date range in query and use an empty category when no category filter applies. Keep chat text concise.`;
+    const instructions = `You are a personal finance assistant. Interpret the user's exact message and respond only with JSON matching the supplied schema. Set action to "expense" for transactions, "query" for spending questions, "chat" for conversation, or "clarification" when essential transaction details are missing or ambiguous. For expenses, include every distinct transaction in entries. Never save or log anything. Do not require a category to understand or draft a transaction; use a concise best-effort category. For food, use category "Food". Keep subcategory to a short label of one to three words, and never put category hierarchies, alternatives, explanations, or system-like text in it. For a lunch transaction, use category "Food", subcategory "Lunch", description "lunch", and an empty merchant unless a merchant is explicitly identified. Keep descriptions brief and leave merchant empty if unknown. Never invent an amount. If the amount is missing or ambiguous, set needs_clarification to true, provide one concise clarification_question, and leave entries empty. Preserve negative amounts as income. For a split, include the full original total, the user's personal share as entry amount, and each other person's owed amount in split. Use today's date in India if none is given: ${todayIST}. Use "UPI" as payment_method only as a fallback. For queries, include the requested date range in query and use an empty category when no category filter applies. Keep chat text concise.`;
     console.log(`[DEBUG] Calling Gemini API...`);
 
     if (GEMINI_API_KEYS.length === 0) {
@@ -719,7 +720,7 @@ async function processReceiptImage(imageBuffer, mimeType, caption, spreadsheetId
     if (GEMINI_API_KEYS.length === 0) return { error: 'Server Configuration Error: Missing Gemini API Key.' };
 
     const todayIST = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
-    const instructions = `Read this receipt and respond only with JSON matching the supplied schema. Set action to "expense" or "clarification". Extract the FULL final payable amount printed on the receipt before applying any split, and extract only information visible in the receipt. ${caption ? "Treat the user's caption as instructions for categorizing or dividing the full receipt total; do not change the receipt total merely because of the caption." : ''} If the full payable amount is unclear, set needs_clarification to true and ask one concise question. Apply any split requested in the caption or visible transaction message in the JSON entry's split field. Use today's date in India if no date is visible: ${todayIST}. Do not log or save anything.`;
+    const instructions = `Read this receipt and respond only with JSON matching the supplied schema. Set action to "expense" or "clarification". Extract the FULL final payable amount printed on the receipt before applying any split, and extract only information visible in the receipt. Use concise category and subcategory values; for food use category "Food" and a one-to-three-word subcategory. Never include a category hierarchy or explanatory text in the subcategory. Keep descriptions brief and leave merchant empty when no merchant is visible. ${caption ? "Treat the user's caption as instructions for categorizing or dividing the full receipt total; do not change the receipt total merely because of the caption." : ''} If the full payable amount is unclear, set needs_clarification to true and ask one concise question. Apply any split requested in the caption or visible transaction message in the JSON entry's split field. Use today's date in India if no date is visible: ${todayIST}. Do not log or save anything.`;
     const parts = [{ text: instructions }];
     if (caption) parts.push({ text: caption });
     parts.push({ inlineData: { mimeType: mimeType || 'image/jpeg', data: imageBuffer.toString('base64') } });

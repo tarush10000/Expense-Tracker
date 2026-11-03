@@ -108,6 +108,8 @@ Each Gemini request randomly selects a model supported by the standard `generate
 
 `gemini-3.8-live` is not included because it requires the real-time bidirectional streaming API rather than `generateContent`. If a request hits a rate limit or a temporary service-availability error, the server retries with a different model and a newly selected API key when available. Text messages and receipt images use a schema-constrained JSON response so Gemini identifies the request type and supplies transaction details, including any owed split amounts.
 
+Food transactions use the concise category `Food` and a short subcategory such as `Lunch`; descriptions stay brief, and the merchant is left blank when it is unknown.
+
 ## Telegram Setup
 
 1. Create a bot with [@BotFather](https://t.me/BotFather) using `/newbot`.
