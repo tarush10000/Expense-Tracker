@@ -108,7 +108,7 @@ Each Gemini request randomly selects a model supported by the standard `generate
 
 `gemini-3.8-live` is not included because it requires the real-time bidirectional streaming API rather than `generateContent`. If a request hits a rate limit or a temporary service-availability error, the server retries with a different model and a newly selected API key when available. Text messages and receipt images use a schema-constrained JSON response so Gemini identifies the request type and supplies transaction details, including any owed split amounts.
 
-Food transactions use the concise category `Food` and a short subcategory such as `Lunch`; descriptions stay brief, and the merchant is left blank when it is unknown.
+Food transactions use the concise category `Food` and a short subcategory such as `Lunch`; descriptions stay brief, and the merchant is left blank when it is unknown. Subcategories are normalized before saving to strip repeated or instruction-like text.
 
 ## Telegram Setup
 
@@ -166,6 +166,22 @@ A split expense is written as:
 
 This records `231` as the expense and adds separate rows for Vaibhav and Yash in the `Owed` sheet. The owed rows include the date, person's name, amount, original expense amount, timestamp, running total, and the original message as `Reason / Note`.
 
+If the remaining share is yours, say so explicitly:
+
+```text
+530 (Blinkit 21 Oct) - 420 Vaibhav, rest me
+```
+
+This records ₹110 as your expense and adds ₹420 owed by Vaibhav. The app preserves this explicit split even if Gemini omits the owed details in its JSON response.
+
+Natural wording is supported too:
+
+```text
+I paid ₹530 for Blinkit. Vaibhav owes me ₹420 and I covered the rest.
+```
+
+This records the same ₹110 personal expense and ₹420 owed by Vaibhav. If a message clearly describes a split but the shares are ambiguous, the assistant asks for clarification instead of recording it as an unsplit expense.
+
 The assistant also understands equal splits and reasons:
 
 ```text
@@ -202,6 +218,8 @@ Repayments reduce the person's outstanding balance while preserving the original
 /last        Most recent expense
 /undo        Remove the most recent expense
 ```
+
+`/undo` removes the last transaction added, even if it was backdated into a different month's sheet. Its associated owed rows are removed too.
 
 ## API Endpoints
 

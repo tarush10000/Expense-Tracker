@@ -72,7 +72,7 @@ const GEMINI_RESPONSE_SCHEMA = {
                 properties: {
                     amount: { type: 'NUMBER' },
                     category: { type: 'STRING', description: 'Use a concise category name. For food, use Food.' },
-                    subcategory: { type: 'STRING', description: 'Use a short, specific label of one to three words, never a category hierarchy or explanatory text.' },
+                    subcategory: { type: 'STRING', description: 'Return only the actual short label, preferably one word, maximum three words and 30 characters. Never repeat words or include formatting instructions.' },
                     description: { type: 'STRING', description: 'Use a brief plain-language description of the transaction.' },
                     merchant: { type: 'STRING', description: 'Use the merchant name only when the user or receipt identifies one; otherwise use an empty string.' },
                     payment_method: { type: 'STRING' },
@@ -80,6 +80,7 @@ const GEMINI_RESPONSE_SCHEMA = {
                     date: { type: 'STRING', description: 'YYYY-MM-DD format' },
                     split: {
                         type: 'OBJECT',
+                        description: 'For a split transaction, include the full amount, each other person’s owed share, and exclude those shares from the user’s amount.',
                         properties: {
                             original_amount: { type: 'NUMBER' },
                             reason: { type: 'STRING' },
@@ -176,6 +177,67 @@ function parseGeminiJson(response) {
         throw new Error('Gemini returned an unsupported response action.');
     }
     return result;
+}
+
+function normalizeSubcategory(value) {
+    const stopWords = new Set(['central', 'label', 'short', 'plain', 'language', 'text', 'format', 'category', 'subcategory']);
+    const words = String(value || '').trim().split(/\s+/).filter(Boolean);
+    const normalized = [];
+
+    for (const word of words) {
+        const cleanWord = word.replace(/^[,.;:]+|[,.;:]+$/g, '');
+        const lowerWord = cleanWord.toLowerCase();
+        if (!cleanWord || stopWords.has(lowerWord)) break;
+        if (normalized[normalized.length - 1]?.toLowerCase() === lowerWord) continue;
+        normalized.push(cleanWord);
+        if (normalized.length === 3) break;
+    }
+
+    return normalized.join(' ') || 'General';
+}
+
+function parseAddedAtTimestamp(value) {
+    if (!value) return null;
+    const timestamp = Date.parse(String(value).trim().replace(/^(\d{4}-\d{2}-\d{2})\s+/, '$1T'));
+    return Number.isFinite(timestamp) ? timestamp : null;
+}
+
+async function getLatestAddedExpense(spreadsheetId, spreadsheetInfo) {
+    const monthNames = 'January|February|March|April|May|June|July|August|September|October|November|December';
+    const monthlySheets = (spreadsheetInfo.data.sheets || [])
+        .filter(sheet => new RegExp(`^(?:${monthNames}) \\d{4}$`).test(sheet.properties.title));
+    const sheetRows = await Promise.all(monthlySheets.map(async sheet => {
+        const response = await sheets.spreadsheets.values.get({
+            spreadsheetId,
+            range: sheet.properties.title
+        });
+        return { sheet, rows: response.data.values || [] };
+    }));
+
+    let latest = null;
+    let fallback = null;
+    for (const { sheet, rows } of sheetRows) {
+        for (let rowIndex = 1; rowIndex < rows.length; rowIndex++) {
+            const row = rows[rowIndex];
+            if (!row[0] && !row[1]) continue;
+
+            const candidate = {
+                sheet,
+                row,
+                rowIndex,
+                timestamp: parseAddedAtTimestamp(row[8])
+            };
+            if (!fallback || (sheet.properties.index || 0) > (fallback.sheet.properties.index || 0) ||
+                ((sheet.properties.index || 0) === (fallback.sheet.properties.index || 0) && rowIndex > fallback.rowIndex)) {
+                fallback = candidate;
+            }
+            if (candidate.timestamp !== null && (!latest || candidate.timestamp >= latest.timestamp)) {
+                latest = candidate;
+            }
+        }
+    }
+
+    return latest || fallback;
 }
 
 function getMonthSheetName(dateInput = new Date()) {
@@ -339,13 +401,16 @@ async function ensureLimitsSheetExists(spreadsheetId) {
 function parseSplitExpenseMessage(message) {
     const text = message.trim();
     const amountMatch = text.match(/^(\d+(?:\.\d+)?)(.*)$/);
-    if (!amountMatch) return null;
+    if (!amountMatch) return parseNaturalLanguageSplit(text);
 
     const originalAmount = Number(amountMatch[1]);
     const body = amountMatch[2].trim();
     const reasonMatch = body.match(/^\(([^)]+)\)/);
     const reason = reasonMatch?.[1]?.trim() || 'Split expense';
     const splitInstruction = body.replace(/^\([^)]*\)\s*/, '').replace(/^[-:]\s*/, '').trim();
+    const hasSplitMarker = /^[-:]/.test(body.replace(/^\([^)]*\)\s*/, '').trim()) ||
+        /^(?:split|divide|share)\b/i.test(splitInstruction);
+    if (!hasSplitMarker) return parseNaturalLanguageSplit(text);
 
     const groupedSplitMatch = splitInstruction.match(/^(\d+(?:\.\d+)?)\s*\(([^)]+)\)\s*,\s*rest\s*\(([^)]+)\)$/i);
     if (groupedSplitMatch) {
@@ -427,11 +492,14 @@ function parseSplitExpenseMessage(message) {
 
     if (!splitInstruction) return null;
 
-    const owedEntries = splitInstruction.split(',').map(entry => {
-        const entryMatch = entry.match(/^\s*(\d+(?:\.\d+)?)\s+(.+?)\s*$/);
-        if (!entryMatch) return null;
-        return { amount: Number(entryMatch[1]), name: entryMatch[2].trim() };
-    });
+    const splitParts = splitInstruction.split(',').map(entry => entry.trim());
+    const owedEntries = splitParts
+        .filter(entry => !/^(?:the\s+)?rest(?:\s+is)?\s+(?:for\s+)?(?:me|myself|i)$/i.test(entry))
+        .map(entry => {
+            const entryMatch = entry.match(/^\s*(\d+(?:\.\d+)?)\s+(.+?)\s*$/);
+            if (!entryMatch) return null;
+            return { amount: Number(entryMatch[1]), name: entryMatch[2].trim() };
+        });
 
     if (owedEntries.some(entry => !entry) || owedEntries.length === 0) return null;
 
@@ -445,6 +513,106 @@ function parseSplitExpenseMessage(message) {
         owedEntries,
         reason: reasonMatch?.[1]?.trim() || 'Split expense'
     };
+}
+
+function hasOwedSplitIntent(message) {
+    return /\b(?:split|shared|share|owes?|owed(?: to me| by)|reimburse|pay me back|pay me|rest (?:is )?(?:me|mine))\b/i.test(message);
+}
+
+function parseNaturalLanguageSplit(message) {
+    if (!hasOwedSplitIntent(message)) return null;
+
+    const amountPattern = '(?:₹|rs\\.?\\s*)?([\\d,]+(?:\\.\\d{1,2})?)';
+    const amountAfter = phrases => message.match(new RegExp(
+        `\\b(?:${phrases})\\s*(?:(?:amount|of|at|for|is|was|the|a|an|total|bill)\\s*)*${amountPattern}`,
+        'i'
+    ));
+    const totalMatch = message.match(new RegExp(`^\\s*${amountPattern}`, 'i')) ||
+        amountAfter('total|bill|cost|came to') ||
+        amountAfter('spent|paid|expense|worth') ||
+        amountAfter('split|shared?|divide|divided');
+    if (!totalMatch) return null;
+
+    const originalAmount = Number(totalMatch[1].replace(/,/g, ''));
+    if (!Number.isFinite(originalAmount) || originalAmount <= 0) return null;
+
+    const owedEntries = [];
+    const namePattern = "([\\p{Lu}][\\p{L}-]*)";
+    const currencyAmountPattern = '(?:₹|rs\\.?\\s*)?([\\d,]+(?:\\.\\d{1,2})?)';
+    const owedByName = new RegExp(`\\b${namePattern}\\s+(?:owes?|should pay|has to pay|needs to pay)\\s+(?:me\\s+)?${currencyAmountPattern}`, 'giu');
+    const amountOwedBy = new RegExp(`${currencyAmountPattern}\\s+(?:is\\s+)?owed\\s+by\\s+${namePattern}`, 'giu');
+    const namedShare = new RegExp(`\\b${namePattern}(?:'s)?\\s+(?:share|portion|part)\\s+(?:is|was|comes to|of)?\\s*${currencyAmountPattern}`, 'giu');
+
+    for (const match of message.matchAll(owedByName)) {
+        if (!/^(?:i|we|me|myself)$/i.test(match[1])) {
+            owedEntries.push({ name: match[1].trim(), amount: Number(match[2].replace(/,/g, '')) });
+        }
+    }
+    for (const match of message.matchAll(amountOwedBy)) {
+        if (!/^(?:i|we|me|myself)$/i.test(match[2])) {
+            owedEntries.push({ amount: Number(match[1].replace(/,/g, '')), name: match[2].trim() });
+        }
+    }
+    for (const match of message.matchAll(namedShare)) {
+        if (!/^(?:i|we|me|myself)$/i.test(match[1])) {
+            owedEntries.push({ name: match[1].trim(), amount: Number(match[2].replace(/,/g, '')) });
+        }
+    }
+
+    if (owedEntries.length) {
+        const totalOwed = owedEntries.reduce((total, entry) => total + entry.amount, 0);
+        if (owedEntries.some(entry => !entry.name || !Number.isFinite(entry.amount) || entry.amount <= 0) || totalOwed > originalAmount) {
+            return { error: 'The people’s owed amounts must be positive and cannot exceed the full transaction amount.' };
+        }
+        return {
+            amount: Number((originalAmount - totalOwed).toFixed(2)),
+            originalAmount,
+            owedEntries,
+            reason: 'Split expense'
+        };
+    }
+
+    const participantsMatch = message.match(/\b(?:split|shared?|divide|divided)\b[^.;]*?\b(?:between|among|with)\s+([^.;]+)/i);
+    if (participantsMatch) {
+        const participants = participantsMatch[1]
+            .replace(/\band\b/gi, ',')
+            .split(',')
+            .map(name => name.trim().replace(/^(?:me|myself|I)$/i, 'me'))
+            .filter(Boolean);
+        if (!participants.some(name => /^(?:me|myself|i)$/i.test(name))) participants.push('me');
+        const uniqueParticipants = [...new Set(participants.map(name => name.toLowerCase()))];
+        const owedPeople = participants.filter(name => !/^(?:me|myself|i)$/i.test(name));
+        if (uniqueParticipants.length >= 2 && owedPeople.length) {
+            const share = Number((originalAmount / uniqueParticipants.length).toFixed(2));
+            const owed = owedPeople.map(name => ({ name, amount: share }));
+            return {
+                amount: Number((originalAmount - owed.reduce((total, entry) => total + entry.amount, 0)).toFixed(2)),
+                originalAmount,
+                owedEntries: owed,
+                reason: 'Split equally'
+            };
+        }
+    }
+
+    return null;
+}
+
+function applyExplicitSplitToDraft(message, draft, useDraftAmount = false) {
+    if (draft.entries.length !== 1) return null;
+
+    const entry = draft.entries[0];
+    const split = parseSplitExpenseMessage(message) ||
+        (useDraftAmount ? parseSplitExpenseMessage(`${entry.amount} - ${message}`) : null);
+    if (split?.error) return { error: split.error };
+    if (!split?.owedEntries?.length) return null;
+
+    entry.amount = split.amount;
+    entry.split = {
+        original_amount: split.originalAmount,
+        reason: split.reason,
+        owed_entries: split.owedEntries
+    };
+    return null;
 }
 
 function completePendingSplit(pending, namesMessage) {
@@ -524,7 +692,7 @@ async function recordExpenseData(expenseData, spreadsheetId) {
         expenseData.date = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
     }
     expenseData.description = String(expenseData.description || expenseData.merchant || 'Expense').trim();
-    expenseData.subcategory = String(expenseData.subcategory || 'General').trim();
+    expenseData.subcategory = normalizeSubcategory(expenseData.subcategory);
     expenseData.merchant = String(expenseData.merchant || '').trim();
     expenseData.payment_method = String(expenseData.payment_method || 'UPI').trim();
     expenseData.need_want = expenseData.need_want === 'Want' ? 'Want' : 'Need';
@@ -532,9 +700,7 @@ async function recordExpenseData(expenseData, spreadsheetId) {
     const transactionId = crypto.randomUUID();
     expenseData.transactionId = transactionId;
     const d = new Date();
-    const datePart = d.toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
-    const timePart = d.toLocaleTimeString('en-GB', { timeZone: 'Asia/Kolkata' });
-    const addedAtTime = `${datePart} ${timePart}`;
+    const addedAtTime = d.toISOString();
 
     if (sheets && spreadsheetId) {
         const sheetName = getMonthSheetName(expenseData.date);
@@ -564,7 +730,6 @@ async function recordExpenseData(expenseData, spreadsheetId) {
 async function recordSplitExpense(splitData, spreadsheetId) {
     const transactionId = crypto.randomUUID();
     const datePart = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
-    const timePart = new Date().toLocaleTimeString('en-GB', { timeZone: 'Asia/Kolkata' });
     const expenseData = {
         is_error: false,
         amount: splitData.amount,
@@ -577,7 +742,7 @@ async function recordSplitExpense(splitData, spreadsheetId) {
         date: datePart,
         transactionId
     };
-    const addedAtTime = `${datePart} ${timePart}`;
+    const addedAtTime = new Date().toISOString();
 
     if (sheets && spreadsheetId) {
         const sheetName = getMonthSheetName(expenseData.date);
@@ -637,8 +802,7 @@ async function recordExpenseDraft(draft, spreadsheetId) {
 
         const owed = split?.owed_entries || [];
         if (owed.length) {
-            const time = new Date().toLocaleTimeString('en-GB', { timeZone: 'Asia/Kolkata' });
-            const addedAt = `${new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' })} ${time}`;
+            const addedAt = new Date().toISOString();
             await appendOwedEntries({
                 originalAmount: Number(split.original_amount),
                 reason: split.reason || 'Split expense',
@@ -653,7 +817,7 @@ async function recordExpenseDraft(draft, spreadsheetId) {
 
 async function processExpenseMessage(message, spreadsheetId) {
     const todayIST = new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata', month: 'long', day: 'numeric', year: 'numeric', hour: 'numeric', minute: 'numeric', hour12: true });
-    const instructions = `You are a personal finance assistant. Interpret the user's exact message and respond only with JSON matching the supplied schema. Set action to "expense" for transactions, "query" for spending questions, "chat" for conversation, or "clarification" when essential transaction details are missing or ambiguous. For expenses, include every distinct transaction in entries. Never save or log anything. Do not require a category to understand or draft a transaction; use a concise best-effort category. For food, use category "Food". Keep subcategory to a short label of one to three words, and never put category hierarchies, alternatives, explanations, or system-like text in it. For a lunch transaction, use category "Food", subcategory "Lunch", description "lunch", and an empty merchant unless a merchant is explicitly identified. Keep descriptions brief and leave merchant empty if unknown. Never invent an amount. If the amount is missing or ambiguous, set needs_clarification to true, provide one concise clarification_question, and leave entries empty. Preserve negative amounts as income. For a split, include the full original total, the user's personal share as entry amount, and each other person's owed amount in split. Use today's date in India if none is given: ${todayIST}. Use "UPI" as payment_method only as a fallback. For queries, include the requested date range in query and use an empty category when no category filter applies. Keep chat text concise.`;
+    const instructions = `You are a personal finance assistant. Interpret the user's exact message and respond only with JSON matching the supplied schema. Set action to "expense" for transactions, "query" for spending questions, "chat" for conversation, or "clarification" when essential transaction details are missing or ambiguous. For expenses, include every distinct transaction in entries. Never save or log anything. Do not require a category to understand or draft a transaction; use a concise best-effort category. For food, use category "Food". Subcategory must be only the actual short label: usually one word, never more than three words or 30 characters. Do not include words like "label", "plain", "language", "text", "format", "central", "category", or "subcategory" unless they are genuinely part of the actual item name. Do not repeat words or output instructions/explanations in a subcategory. For lunch, output exactly subcategory "Lunch" and description "lunch". Keep descriptions brief and leave merchant empty if unknown. Never invent an amount. If the amount is missing or ambiguous, set needs_clarification to true, provide one concise clarification_question, and leave entries empty. Preserve negative amounts as income. For splits described in any wording, entry.amount is only the user's personal share; split.original_amount is the full bill; split.owed_entries lists every other person's share. The user's amount plus all owed amounts must equal the original amount. For example, "530 (Blinkit 21 Oct) - 420 Vaibhav, rest me" and "I paid 530 for Blinkit. Vaibhav owes me 420 and I covered the rest." both mean entry.amount 110, split.original_amount 530, and split.owed_entries [{name:"Vaibhav", amount:420}]. "We split the 530 bill between me and Vaibhav" means each pays 265. Never omit an explicitly mentioned person owed money. Use today's date in India if none is given: ${todayIST}. Use "UPI" as payment_method only as a fallback. For queries, include the requested date range in query and use an empty category when no category filter applies. Keep chat text concise.`;
     console.log(`[DEBUG] Calling Gemini API...`);
 
     if (GEMINI_API_KEYS.length === 0) {
@@ -690,6 +854,14 @@ async function processExpenseMessage(message, spreadsheetId) {
         if (!result.entries?.length) {
             return { type: 'clarification', text: 'What transaction would you like me to record?' };
         }
+        const splitResult = applyExplicitSplitToDraft(message, result);
+        if (splitResult?.error) return splitResult;
+        if (hasOwedSplitIntent(message) && result.entries.some(entry => !entry.split)) {
+            return {
+                type: 'clarification',
+                text: 'I understood that this transaction involves a split, but could not determine each person’s share. Please state the full amount and how much each person owes.'
+            };
+        }
         return recordExpenseDraft(result, spreadsheetId);
     }
 
@@ -720,7 +892,7 @@ async function processReceiptImage(imageBuffer, mimeType, caption, spreadsheetId
     if (GEMINI_API_KEYS.length === 0) return { error: 'Server Configuration Error: Missing Gemini API Key.' };
 
     const todayIST = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
-    const instructions = `Read this receipt and respond only with JSON matching the supplied schema. Set action to "expense" or "clarification". Extract the FULL final payable amount printed on the receipt before applying any split, and extract only information visible in the receipt. Use concise category and subcategory values; for food use category "Food" and a one-to-three-word subcategory. Never include a category hierarchy or explanatory text in the subcategory. Keep descriptions brief and leave merchant empty when no merchant is visible. ${caption ? "Treat the user's caption as instructions for categorizing or dividing the full receipt total; do not change the receipt total merely because of the caption." : ''} If the full payable amount is unclear, set needs_clarification to true and ask one concise question. Apply any split requested in the caption or visible transaction message in the JSON entry's split field. Use today's date in India if no date is visible: ${todayIST}. Do not log or save anything.`;
+    const instructions = `Read this receipt and respond only with JSON matching the supplied schema. Set action to "expense" or "clarification". Extract the FULL final payable amount printed on the receipt before applying any split, and extract only information visible in the receipt. For subcategory, return only the actual label (usually one word, maximum three words and 30 characters); never repeat words or include "label", "plain", "language", "text", "format", "central", "category", "subcategory", or explanation. For lunch, output exactly subcategory "Lunch" and description "lunch". Use concise category values; for food use "Food". Keep descriptions brief and leave merchant empty when no merchant is visible. ${caption ? "Treat the user's caption as instructions for categorizing or dividing the full receipt total; do not change the receipt total merely because of the caption." : ''} If the full payable amount is unclear, set needs_clarification to true and ask one concise question. Apply any split requested in the caption or visible transaction message in the JSON entry's split field. Use today's date in India if no date is visible: ${todayIST}. Do not log or save anything.`;
     const parts = [{ text: instructions }];
     if (caption) parts.push({ text: caption });
     parts.push({ inlineData: { mimeType: mimeType || 'image/jpeg', data: imageBuffer.toString('base64') } });
@@ -739,6 +911,16 @@ async function processReceiptImage(imageBuffer, mimeType, caption, spreadsheetId
                 type: 'clarification',
                 text: expenseData.clarification_question || 'I could not read a clear amount from that receipt.'
             };
+        }
+        if (caption) {
+            const splitResult = applyExplicitSplitToDraft(caption, expenseData, true);
+            if (splitResult?.error) return splitResult;
+            if (hasOwedSplitIntent(caption) && expenseData.entries.some(entry => !entry.split)) {
+                return {
+                    type: 'clarification',
+                    text: 'I understood that this receipt involves a split, but could not determine each person’s share. Please state the full amount and how much each person owes.'
+                };
+            }
         }
         return recordExpenseDraft(expenseData, spreadsheetId);
     } catch (error) {
@@ -1147,93 +1329,41 @@ async function queryExpenses(startDate, endDate, category, spreadsheetId) {
 
 async function getLastExpense(spreadsheetId) {
     if (!sheets || !spreadsheetId) return null;
-    const sheetName = getMonthSheetName();
     try {
-        const response = await sheets.spreadsheets.values.get({ spreadsheetId: spreadsheetId, range: sheetName }).catch(() => null);
-        if (!response || !response.data.values) return null;
+        const spreadsheetInfo = await sheets.spreadsheets.get({ spreadsheetId });
+        const latest = await getLatestAddedExpense(spreadsheetId, spreadsheetInfo);
+        if (!latest) return null;
 
-        const rows = response.data.values;
-        if (rows.length <= 1) return null;
-
-        let maxRowIndex = -1;
-        let maxDate = 0;
-        let lastRow = null;
-
-        for (let i = 1; i < rows.length; i++) {
-            const addedAtStr = rows[i][8];
-            if (addedAtStr) {
-                let ms = new Date(addedAtStr).getTime();
-                if (isNaN(ms)) ms = new Date(addedAtStr.replace(' ', 'T')).getTime();
-
-                if (ms > maxDate) {
-                    maxDate = ms;
-                    maxRowIndex = i;
-                    lastRow = rows[i];
-                }
-            }
-        }
-
-        if (lastRow) {
-            // [Date, Amount, Category, Subcategory, Merchant, Description, Payment Method, Need/Want, AddedAt]
-            return {
-                date: lastRow[0],
-                amount: lastRow[1],
-                category: lastRow[2],
-                description: lastRow[5],
-                addedAt: lastRow[8]
-            };
-        }
-        return null;
+        return {
+            date: latest.row[0],
+            amount: latest.row[1],
+            category: latest.row[2],
+            description: latest.row[5],
+            addedAt: latest.row[8]
+        };
     } catch (e) {
-        console.error(e);
+        console.error('Could not find the latest expense:', e.message);
         return null;
     }
 }
 
 async function undoLastExpense(spreadsheetId) {
     if (!sheets || !spreadsheetId) return null;
-    const sheetName = getMonthSheetName();
     try {
-        const spreadsheetInfo = await sheets.spreadsheets.get({ spreadsheetId: spreadsheetId });
-        const sheet = spreadsheetInfo.data.sheets.find(s => s.properties.title === sheetName);
-        if (!sheet) return null;
-        const sheetId = sheet.properties.sheetId;
+        const spreadsheetInfo = await sheets.spreadsheets.get({ spreadsheetId });
+        const latest = await getLatestAddedExpense(spreadsheetId, spreadsheetInfo);
+        if (!latest) return null;
 
-        const response = await sheets.spreadsheets.values.get({ spreadsheetId: spreadsheetId, range: sheetName });
-        const rows = response.data.values || [];
-        if (rows.length <= 1) return null; // No data rows
-
-        let maxRowIndex = -1;
-        let maxDate = 0;
-        let deletedAmount = 0;
-
-        for (let i = 1; i < rows.length; i++) {
-            const addedAtStr = rows[i][8];
-            if (addedAtStr) {
-                let ms = new Date(addedAtStr).getTime();
-                if (isNaN(ms)) ms = new Date(addedAtStr.replace(' ', 'T')).getTime();
-
-                if (ms > maxDate) {
-                    maxDate = ms;
-                    maxRowIndex = i;
-                    deletedAmount = rows[i][1];
-                }
-            }
-        }
-
-        if (maxRowIndex === -1) {
-            maxRowIndex = rows.length - 1;
-            deletedAmount = rows[maxRowIndex][1];
-        }
-
-        const transactionId = rows[maxRowIndex][10];
+        const { sheet, row, rowIndex } = latest;
+        const deletedAmount = row[1];
+        const transactionId = row[10];
         const requests = [{
             deleteDimension: {
                 range: {
-                    sheetId: sheetId,
+                    sheetId: sheet.properties.sheetId,
                     dimension: "ROWS",
-                    startIndex: maxRowIndex,
-                    endIndex: maxRowIndex + 1
+                    startIndex: rowIndex,
+                    endIndex: rowIndex + 1
                 }
             }
         }];
@@ -1269,7 +1399,7 @@ async function undoLastExpense(spreadsheetId) {
         });
         return deletedAmount;
     } catch (e) {
-        console.error(e);
+        console.error('Could not undo the latest expense:', e.message);
         return null;
     }
 }
