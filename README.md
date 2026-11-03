@@ -101,13 +101,12 @@ Never commit `.env`, `credentials.json`, or API keys. They are excluded by `.git
 
 ## Gemini Model Selection
 
-Each Gemini request randomly selects a model using these weights:
+Each Gemini request randomly selects a model supported by the standard `generateContent` API using these weights:
 
-- `gemini-3.8-flash`: 65% (most likely)
-- `gemini-3.8-live`: 25%
+- `gemini-3.8-flash`: 90% (most likely)
 - `gemini-3.6-flash`: 10% (least likely)
 
-If a request hits a rate limit, the server retries with a newly selected model and API key when available. Text messages and receipt images use a schema-constrained JSON response so Gemini identifies the request type and supplies transaction details, including any owed split amounts.
+`gemini-3.8-live` is not included because it requires the real-time bidirectional streaming API rather than `generateContent`. If a request hits a rate limit or a temporary service-availability error, the server retries with a different model and a newly selected API key when available. Text messages and receipt images use a schema-constrained JSON response so Gemini identifies the request type and supplies transaction details, including any owed split amounts.
 
 ## Telegram Setup
 

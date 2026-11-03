@@ -54,8 +54,7 @@ const CATEGORIES = [
 
 const GEMINI_MODELS = [
     { name: 'gemini-3.6-flash', weight: 10 },
-    { name: 'gemini-3.8-live', weight: 25 },
-    { name: 'gemini-3.8-flash', weight: 65 }
+    { name: 'gemini-3.8-flash', weight: 90 }
 ];
 
 const GEMINI_RESPONSE_SCHEMA = {
@@ -114,21 +113,26 @@ const GEMINI_RESPONSE_SCHEMA = {
     required: ['action', 'text', 'needs_clarification', 'clarification_question', 'entries', 'query']
 };
 
-function getRandomGeminiModel() {
-    const totalWeight = GEMINI_MODELS.reduce((total, model) => total + model.weight, 0);
+function getRandomGeminiModel(excludedModel) {
+    const availableModels = GEMINI_MODELS.filter(model => model.name !== excludedModel);
+    const totalWeight = availableModels.reduce((total, model) => total + model.weight, 0);
     let selection = Math.random() * totalWeight;
-    for (const model of GEMINI_MODELS) {
+    for (const model of availableModels) {
         selection -= model.weight;
         if (selection < 0) return model.name;
     }
-    return GEMINI_MODELS[GEMINI_MODELS.length - 1].name;
+    return availableModels[availableModels.length - 1].name;
 }
 
-function isRateLimitError(error) {
-    return error.status === 429 ||
-        (error.message && (error.message.includes('429') ||
-            error.message.includes('Too Many Requests') ||
-            error.message.toLowerCase().includes('quota')));
+function isRetryableGeminiError(error) {
+    const message = String(error.message || '').toLowerCase();
+    return error.status === 429 || error.status === 503 ||
+        message.includes('429') ||
+        message.includes('too many requests') ||
+        message.includes('quota') ||
+        message.includes('503') ||
+        message.includes('unavailable') ||
+        message.includes('high demand');
 }
 
 async function generateGeminiContent(contents, config = {}) {
@@ -137,16 +141,18 @@ async function generateGeminiContent(contents, config = {}) {
     }
 
     const maxAttempts = Math.min(GEMINI_API_KEYS.length + 1, 3);
+    let previousModel;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         const ai = new GoogleGenAI({ apiKey: getRandomGeminiKey() });
-        const model = getRandomGeminiModel();
+        const model = getRandomGeminiModel(previousModel);
         try {
             const response = await ai.models.generateContent({ model, contents, config });
             return response;
         } catch (error) {
             console.error(`[DEBUG] ❌ Gemini API threw an error on attempt ${attempt} using ${model}:`, error.message);
-            if (!isRateLimitError(error) || attempt === maxAttempts) throw error;
-            console.log('⚠️ Rate limit encountered. Retrying with a newly selected key and model...');
+            if (!isRetryableGeminiError(error) || attempt === maxAttempts) throw error;
+            previousModel = model;
+            console.log('⚠️ Gemini service is busy or rate limited. Retrying with a newly selected key and model...');
         }
     }
 
