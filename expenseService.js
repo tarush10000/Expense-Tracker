@@ -106,7 +106,7 @@ const GEMINI_RESPONSE_SCHEMA = {
             properties: {
                 startDate: { type: 'STRING', description: 'YYYY-MM-DD' },
                 endDate: { type: 'STRING', description: 'YYYY-MM-DD' },
-                category: { type: 'STRING', enum: ['', ...CATEGORIES] }
+                category: { type: 'STRING', description: 'Optional category filter; use an empty string when no category filter applies.' }
             },
             required: ['startDate', 'endDate', 'category']
         }
